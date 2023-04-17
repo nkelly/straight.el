@@ -218,7 +218,7 @@ set **before** the bootstrap code runs, if they might affect how
   private Git repositories in your configuration, then you might want
   to use SSH instead.
 * `straight-base-dir` --
-  by default, straight's main directory, containing it's build files and
+  by default, straight's main directory, containing its build files and
   package repos, is located in `user-emacs-directory`. You can change
   the location of straight's base directory via this variable.
 * `straight-build-dir` --
@@ -226,6 +226,11 @@ set **before** the bootstrap code runs, if they might affect how
   `straight-base-dir`/build. Changing this variable will change the name
   of that directory and the name of the build cache file (unless
   `straight-build-cache-fixed-name` is non-nil).
+* `straight-use-version-specific-build-dir` -- if non-nil, use an
+  Emacs-version-specific `straight-build-dir` directory to support
+  running multiple versions of Emacs against the same
+  `user-emacs-directory`. There is a minor performance penalty on
+  startup because `straight.el` will not be byte-compiled.
 
 You should remove any code that relates to `package.el`; for example,
 references to `package-initialize`, `package-archives`, and (if you're

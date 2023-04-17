@@ -1,6 +1,6 @@
 ;;; straight.el --- Next-generation package manager -*- lexical-binding: t -*-
 
-;; Copyright (C) 2017-2022 Radian LLC and contributors
+;; Copyright (C) 2017-2023 Radian LLC and contributors
 
 ;; Author: Radian LLC <contact+straight@radian.codes>
 ;; Created: 1 Jan 2017
@@ -78,6 +78,7 @@ They are still logged to the *Messages* buffer.")))
 ;; `comp'
 (declare-function native-compile-async "comp.el")
 (defvar native-comp-deferred-compilation-deny-list)
+(defvar native-comp-jit-compilation-deny-list)
 
 ;; `finder-inf'
 (defvar package--builtins)
@@ -605,7 +606,20 @@ The warning message is obtained by passing MESSAGE and ARGS to
 Defaults to `user-emacs-directory'."
   :type 'string)
 
-(defcustom straight-build-dir "build"
+(defcustom straight-use-version-specific-build-dir nil
+  "If non-nil, use an Emacs-version-specific `straight-build-dir' directory.
+Normally, straight.el uses a single build directory and throws
+\\='emacs-version-changed when attempting to run the byte-compiled
+code in a different version of Emacs. This changes that behavior
+to use a per-Emacs-version build directory based upon the
+variable `emacs-version', for example `build-27.2'.
+
+Setting `straight-build-dir' will override this behavior."
+  :type 'boolean)
+
+(defcustom straight-build-dir (if straight-use-version-specific-build-dir
+                                  (concat "build-" emacs-version)
+                                "build")
   "Name of the directory into which packages are built.
 Relative to the straight/ subdirectory of `straight-base-dir'.
 Defaults to \"build\".
@@ -3135,26 +3149,21 @@ If nil, output is discarded."
 This is to avoid relying on `make` on Windows.
 See: https://github.com/radian-software/straight.el/issues/707"
   (let* ((default-directory (straight--repos-dir "org" "lisp"))
+         (emacs (straight--emacs-path))
          (orgversion
           (straight--process-with-result
-              (straight--process-run "git" "describe" "--match" "release*"
-                                     "--abbrev=0" "HEAD")
-            (if failure
-                ;; backup in case Org repo has no tags
-                (straight--process-with-result
-                    (straight--process-run
-                     (straight--emacs-path) "-Q" "--batch"
-                     "--eval" "(require 'lisp-mnt)"
-                     "--visit" "org.el"
-                     "--eval" "(princ (lm-header \"version\"))")
-                  (if failure
-                      (error "Failed to parse ORGVERSION")
-                    (replace-regexp-in-string "-dev" "" stdout)))
-              (string-trim (replace-regexp-in-string "release_" "" stdout)))))
+              (straight--process-run
+               emacs "-Q" "--batch"
+               "--eval" "(require 'lisp-mnt)"
+               "--visit" "org.el"
+               "--eval" "(princ (lm-header \"version\"))")
+            (when failure (error "Failed to parse ORGVERSION: %S" result))
+            (string-trim (replace-regexp-in-string "-dev" "" stdout))))
          (gitversion
-          (concat orgversion "-g" (straight--process-output
-                                   "git" "rev-parse" "--short=6" "HEAD")))
-         (emacs (concat invocation-directory invocation-name)))
+          (straight--process-with-result
+              (straight--process-run "git" "describe" "--match" "release*"
+                                     "--abbrev=6" "HEAD")
+            (if success (string-trim stdout) "N/A"))))
     (call-process
      emacs nil straight-byte-compilation-buffer nil
      "-Q" "--batch"
@@ -3164,8 +3173,7 @@ See: https://github.com/radian-software/straight.el/issues/707"
      "--eval" "(load \"../mk/org-fixup.el\")"
      ;; Do we want autoloads here, or should straight handle it?
      "--eval" "(org-make-org-loaddefs)"
-     "--eval" (format "(org-make-org-version %S %S)"
-                      orgversion gitversion)
+     "--eval" (format "(org-make-org-version %S %S)" orgversion gitversion)
      "--eval" "(cd \"../doc\")"
      "--eval" "(org-make-manuals)")))
 
@@ -3214,7 +3222,7 @@ Otherwise return nil."
 
 (defun straight-recipes-org-elpa-version ()
   "Return the current version of the Org ELPA retriever."
-  14)
+  15)
 
 ;;;;;; MELPA
 
@@ -3367,7 +3375,9 @@ Otherwise, return nil."
     `( ,(pop recipe)
        :repo ,(plist-get recipe :url)
        ,@(when-let ((ignored (plist-get recipe :ignored-files)))
-           `(:files (:defaults (:exclude ,@ignored)))))))
+           `(:files (:defaults (:exclude ,@(if (listp ignored)
+                                               ignored
+                                             (list ignored)))))))))
 
 (defun straight-recipes-nongnu-elpa--recipes ()
   "Return list of NonGNU ELPA style recipes."
@@ -3390,12 +3400,16 @@ Otherwise, return nil."
 
 (defun straight-recipes-nongnu-elpa-list ()
   "Return a list of NonGNU ELPA recipe names."
-  (mapcar (lambda (it) (symbol-name (car it)))
+  (mapcar (lambda (it)
+            (setq it (car it))
+            (when (symbolp it)
+              (setq it (symbol-name it)))
+            it)
           (straight-recipes-nongnu-elpa--recipes)))
 
 (defun straight-recipes-nongnu-elpa-version ()
   "Return the current version of the NonGNU ELPA retriever."
-  3)
+  4)
 
 ;;;;;; Emacsmirror
 
@@ -5080,10 +5094,16 @@ this run of straight.el)."
                  ;; missing or malformed, we just assume the package
                  ;; has no dependencies.
                  (let ((case-fold-search t))
-                   (re-search-forward "^;* *Package-Requires *: *"))
-                 (when (looking-at "(")
-                   (straight--process-dependencies
-                    (read (current-buffer)))))))))
+                   (re-search-forward "^;* *Package-Requires *: *")
+                   (when-let ((required (list (buffer-substring-no-properties
+                                               (point) (line-end-position)))))
+                     (forward-line 1)
+                     ;; Borrowed from `lm-header-multiline'
+                     (while (looking-at "^;+\\(\t\\|[\t\s]\\{2,\\}\\)\\(.+\\)")
+                       (push (match-string-no-properties 2) required)
+                       (forward-line 1))
+                     (straight--process-dependencies
+                      (read (string-join (nreverse required) " "))))))))))
     (straight--insert 1 package dependencies straight--build-cache)))
 
 (defun straight--get-dependencies (package)
@@ -5231,9 +5251,12 @@ background after `straight-use-package' returns."
         (when (and straight--build-cache
                    (gethash package straight--build-cache))
           (let ((regexp (format "^%s" build-dir)))
-            (setq native-comp-deferred-compilation-deny-list
-                  (cl-remove-if (lambda (denied) (string= denied regexp))
-                                native-comp-deferred-compilation-deny-list))))
+            (dolist (list-var '(native-comp-deferred-compilation-deny-list
+                                native-comp-jit-compilation-deny-list))
+              (when (boundp list-var)
+                (set list-var
+                     (cl-remove-if (lambda (denied) (string= denied regexp))
+                                   (symbol-value list-var)))))))
         (let ((inhibit-message t)
               (message-log-max nil))
           (native-compile-async build-dir 'recursively))))))
@@ -5281,12 +5304,14 @@ repository."
               (push info infos)
               (unless (file-exists-p info)
                 (let ((default-directory (file-name-directory texi)))
-                  (straight--process-run "makeinfo" texi "-o" info)))))))
+                  (straight--process-run straight-makeinfo-executable
+                                         texi "-o" info)))))))
         (let ((dir (straight--build-file package "dir")))
           (unless (file-exists-p dir)
             (dolist (info infos)
               (when (file-exists-p info)
-                (straight--process-run "install-info" info dir)))))))))
+                (straight--process-run straight-install-info-executable
+                                       info dir)))))))))
 
 ;;;;; Cache handling
 
@@ -5593,7 +5618,7 @@ If FORCE is non-nil do not prompt before deleting repos."
 ;;;;; Recipe acquiry
 
 ;;;###autoload
-(defun straight-get-recipe (&optional sources action)
+(defun straight-get-recipe (&optional sources action filter)
   "Interactively select a recipe from one of the recipe repositories.
 All recipe repositories in `straight-recipe-repositories' will
 first be cloned. After the recipe is selected, it will be copied
@@ -5609,7 +5634,11 @@ symbol `interactive', then the user is prompted to select a
 recipe repository, and a list containing that recipe repository
 is used for the value of SOURCES. ACTION may be `copy' (copy
 recipe to the kill ring), `insert' (insert at point), or nil (no
-action, just return it)."
+action, just return it).
+
+Optional arg FILTER must be a unary function.
+It takes a package name as its sole argument.
+If it returns nil the candidate is excluded."
   (interactive (list (when current-prefix-arg 'interactive) 'copy))
   (when (eq sources 'interactive)
     (setq sources (list
@@ -5623,9 +5652,10 @@ action, just return it)."
     (let* ((package (intern
                      (completing-read
                       "Which recipe? "
-                      (cl-remove-if (lambda (pkg)
-                                      (gethash pkg straight--repo-cache))
-                      (straight-recipes-list sources))
+                      (if filter
+                          (cl-remove-if-not filter
+                                            (straight-recipes-list sources))
+                        (straight-recipes-list sources))
                       (lambda (_) t)
                       'require-match)))
            ;; No need to provide a `cause' to
@@ -5749,10 +5779,15 @@ non-nil if the function has been called interactively. It is for
 internal use only, and is used to determine whether to show a
 hint about how to install the package permanently.
 
-Return non-nil if package was actually installed, and nil
-otherwise (this can only happen if NO-CLONE is non-nil)."
+Return non-nil when package is initially installed, nil otherwise."
   (interactive
-   (list (straight-get-recipe (when current-prefix-arg 'interactive))
+   (list (straight-get-recipe
+          (when current-prefix-arg 'interactive) nil
+          (let ((installed nil))
+            ;; Cache keys are :local-repo. We want to compare :package.
+            (maphash (lambda (_ v) (push (plist-get v :package) installed))
+                     straight--repo-cache)
+            (lambda (pkg) (not (member pkg installed)))))
          nil nil nil 'interactive))
   (let ((recipe (straight--convert-recipe
                  (or
@@ -5882,13 +5917,17 @@ otherwise (this can only happen if NO-CLONE is non-nil)."
               'straight-use-package-prepare-functions package)
              ;; Prevent deferred native compilation of packages which
              ;; explicitly disable it.
-             (when (boundp 'native-comp-deferred-compilation-deny-list)
-               (when-let ((build (cadr (plist-member recipe :build))))
-                 (when (and (eq (car-safe build) :not)
-                            (member 'native-compile (cdr build)))
-                   (cl-pushnew (format "^%s" (straight--build-dir package))
-                               native-comp-deferred-compilation-deny-list
-                               :test #'string=))))
+             (dolist (list-var '(native-comp-deferred-compilation-deny-list
+                                 native-comp-jit-compilation-deny-list))
+               (when (boundp list-var)
+                 (when-let ((build (cadr (plist-member recipe :build))))
+                   (when (and (eq (car-safe build) :not)
+                              (member 'native-compile (cdr build)))
+                     (set list-var
+                          (cl-adjoin
+                           (format "^%s" (straight--build-dir package))
+                           (symbol-value list-var)
+                           :test #'string=))))))
              (when (and modified (not no-build))
                (run-hook-with-args
                 'straight-use-package-pre-build-functions package)
